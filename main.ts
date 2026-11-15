@@ -50,14 +50,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   buildCatalog,
-  capabilitiesOf,
   freeModels,
   isRecord,
-  meetsRequirements,
+  ModelTrialTracker,
+  rankCandidates,
   readBrief,
+  refusalTrailHeader,
   type CatalogReport,
   type Json,
-  type ModelRow,
   type Requirement,
 } from './lib/providers.ts';
 import {
@@ -91,8 +91,7 @@ const brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
-const cooldownModels = new Set<string>();
-const serverErrorsByModel = new Map<string, number>();
+const modelTrial = new ModelTrialTracker();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -113,15 +112,6 @@ function servedModels(): ServedModel[] {
     const model = brief.models.find((candidate) => candidate.id === catalogModel.id);
     return model === undefined ? [] : [{ id: model.id, provider: provider.id, display_name: model.display_name }];
   }));
-}
-
-/** Candidates are sorted by quality, with the brief order as a deterministic tie-break. */
-function routesFor(requires: Requirement): ModelRow[] {
-  return freeModels(brief)
-    .map((model, order) => ({ model, order }))
-    .filter(({ model }) => meetsRequirements(requires, capabilitiesOf(model)))
-    .sort((left, right) => right.model.rating_milli - left.model.rating_milli || left.order - right.order)
-    .map(({ model }) => model);
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
@@ -219,48 +209,16 @@ function codeFromError(text: string): string {
   }
 }
 
-function failureHeader(failures: readonly { status: number; code: string; model: string }[]): Record<string, string> {
-  return failures.length === 0
-    ? {}
-    : { 'x-makefun-upstream-failures': JSON.stringify(failures.slice(0, 8)) };
-}
-
-function noteRefusal(model: string, status: number): void {
-  if (status === 429) {
-    cooldownModels.add(model);
-  } else if (status >= 500) {
-    const count = (serverErrorsByModel.get(model) ?? 0) + 1;
-    serverErrorsByModel.set(model, count);
-    if (count >= 2) cooldownModels.add(model);
-  }
-}
-
-function anthropicEventWithModel(event: string, model: string): string {
-  return event.replace(/(^|\n)data: ?([^\n]*)/g, (line, prefix: string, payload: string) => {
-    try {
-      const value: unknown = JSON.parse(payload);
-      if (!isRecord(value)) return line;
-      const updated: Json = { ...value, model };
-      if (value.type === 'message_start' && isRecord(value.message)) {
-        updated.message = { ...value.message, model };
-      }
-      return `${prefix}data: ${JSON.stringify(updated)}`;
-    } catch {
-      return line;
-    }
-  });
-}
-
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by a ranked eligible model. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const candidates = routesFor(requirementsFor(body));
+  const candidates = rankCandidates(freeModels(brief), requirementsFor(body));
   if (candidates.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
   const failures: { status: number; code: string; model: string }[] = [];
   let calls = 0;
   for (const route of candidates) {
-    if (cooldownModels.has(route.id) || calls >= MAX_GATEWAY_CALLS_PER_PROMPT) continue;
+    if (modelTrial.isDropped(route.id) || calls >= MAX_GATEWAY_CALLS_PER_PROMPT) continue;
     calls += 1;
     let upstream: Response;
     try {
@@ -271,13 +229,13 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (upstream.status >= 400) {
       const text = await upstream.text();
       failures.push({ status: upstream.status, code: codeFromError(text), model: route.id });
-      noteRefusal(route.id, upstream.status);
+      modelTrial.noteFailure(route.id, upstream.status);
       continue;
     }
     if (!upstream.ok || upstream.body === null) {
       return sendError(res, 'openai', 502, 'upstream_error', `the gateway returned an unusable HTTP ${upstream.status} response`);
     }
-    const headers = failureHeader(failures);
+    const headers = refusalTrailHeader(failures);
     if (body.stream === true) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...headers });
       try {
@@ -300,12 +258,12 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const candidates = routesFor(requirementsFor(body));
+  const candidates = rankCandidates(freeModels(brief), requirementsFor(body));
   if (candidates.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
   const failures: { status: number; code: string; model: string }[] = [];
   let calls = 0;
   for (const route of candidates) {
-    if (cooldownModels.has(route.id) || calls >= MAX_GATEWAY_CALLS_PER_PROMPT) continue;
+    if (modelTrial.isDropped(route.id) || calls >= MAX_GATEWAY_CALLS_PER_PROMPT) continue;
     calls += 1;
     let upstream: Response;
     try {
@@ -316,19 +274,17 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     if (upstream.status >= 400) {
       const text = await upstream.text();
       failures.push({ status: upstream.status, code: codeFromError(text), model: route.id });
-      noteRefusal(route.id, upstream.status);
+      modelTrial.noteFailure(route.id, upstream.status);
       continue;
     }
     if (!upstream.ok || upstream.body === null) {
       return sendError(res, 'anthropic', 502, 'api_error', `the gateway returned an unusable HTTP ${upstream.status} response`);
     }
-    const headers = failureHeader(failures);
+    const headers = refusalTrailHeader(failures);
     if (body.stream === true) {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', ...headers });
       try {
-        for await (const event of anthropicEventsFromOpenAI(upstream.body, route.id)) {
-          res.write(anthropicEventWithModel(event, route.id));
-        }
+        for await (const event of anthropicEventsFromOpenAI(upstream.body, route.id)) res.write(event);
       } finally {
         res.end();
       }
