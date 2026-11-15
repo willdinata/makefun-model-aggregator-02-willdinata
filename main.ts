@@ -212,7 +212,8 @@ function codeFromError(text: string): string {
     const value: unknown = JSON.parse(text);
     if (!isRecord(value)) return '';
     const error = isRecord(value.error) ? value.error : value;
-    return typeof error.code === 'string' ? error.code : '';
+    if (typeof error.code === 'string') return error.code;
+    return typeof error.code === 'number' && Number.isFinite(error.code) ? String(error.code) : '';
   } catch {
     return '';
   }
