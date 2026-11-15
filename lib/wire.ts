@@ -177,7 +177,7 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   }
 
   const out: Json = { model, messages };
-  if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
+  out.max_tokens = typeof body.max_tokens === 'number' ? body.max_tokens : 1024;
   if (typeof body.temperature === 'number') out.temperature = body.temperature;
   if (typeof body.top_p === 'number') out.top_p = body.top_p;
   if (Array.isArray(body.stop_sequences) && body.stop_sequences.length > 0) out.stop = body.stop_sequences;
